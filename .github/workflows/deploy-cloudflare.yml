@@ -226,6 +226,104 @@ jobs:
           echo "worker_url=$WORKER_URL" >> $GITHUB_OUTPUT
           echo "✅ Setup completed."
 
+      - name: 📮 同步邮件接收 / Sync email receiving
+        run: |
+          echo "🛠️ Starting email receiving setup..."
+          
+          if ! jq -e 'type == "array"' <<< "$DOMAIN" >/dev/null; then
+            echo "❌ DOMAIN variable must be a JSON array (e.g., [\"example.com\"])."
+            exit 1
+          fi
+          
+          api_request() {
+            local method="$1"
+            local path="$2"
+            local data="${3:-}"
+            
+            if [ -n "$data" ]; then
+              curl -sS -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "$data"
+            else
+              curl -sS -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json"
+            fi
+          }
+          
+          check_success() {
+            local response="$1"
+            local action="$2"
+            
+            if ! jq -e '.success == true' <<< "$response" >/dev/null; then
+              echo "::error::${action} failed."
+              jq -r '.errors[]? | "\(.code) \(.message)"' <<< "$response"
+              exit 1
+            fi
+          }
+          
+          find_zone() {
+            local domain="$1"
+            local labels
+            IFS='.' read -ra labels <<< "$domain"
+            
+            for ((i=0; i<${#labels[@]}-1; i++)); do
+              local candidate
+              candidate="$(printf "%s." "${labels[@]:i}")"
+              candidate="${candidate%.}"
+              
+              local response
+              response=$(curl -sS --get "https://api.cloudflare.com/client/v4/zones" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                --data-urlencode "name=${candidate}" \
+                --data-urlencode "status=active")
+              check_success "$response" "Find Cloudflare zone for ${candidate}"
+              
+              local zone_id
+              zone_id=$(jq -r '.result[0].id // empty' <<< "$response")
+              
+              if [ -n "$zone_id" ]; then
+                jq -r '.result[0] | "\(.id) \(.name)"' <<< "$response"
+                return 0
+              fi
+            done
+            
+            return 1
+          }
+          
+          for domain in $(jq -r '.[]' <<< "$DOMAIN"); do
+            domain="${domain#@}"
+            domain="${domain,,}"
+            
+            if ! grep -Eq '^[a-z0-9.-]+$' <<< "$domain"; then
+              echo "::error::Invalid domain: ${domain}"
+              exit 1
+            fi
+            
+            echo "🔍 Configuring email routing for ${domain}..."
+            
+            if ! zone_info=$(find_zone "$domain"); then
+              echo "::error::Cloudflare zone not found for ${domain}."
+              exit 1
+            fi
+            
+            zone_id=$(awk '{print $1}' <<< "$zone_info")
+            zone_name=$(awk '{print $2}' <<< "$zone_info")
+            
+            if [ "$domain" != "$zone_name" ]; then
+              echo "::warning::${domain} is under zone ${zone_name}; enabling Email Routing for the parent zone."
+            fi
+            
+            dns_response=$(api_request "POST" "/zones/${zone_id}/email/routing/dns" "{\"name\":\"${domain}\"}")
+            check_success "$dns_response" "Enable Email Routing DNS for ${domain}"
+            
+            catch_all_response=$(api_request "PUT" "/zones/${zone_id}/email/routing/rules/catch_all" "{\"actions\":[{\"type\":\"worker\",\"value\":[\"${NAME}\"]}],\"matchers\":[{\"type\":\"all\"}],\"enabled\":true}")
+            check_success "$catch_all_response" "Update catch-all rule for ${domain}"
+            
+            echo "✅ Email routing configured for ${domain} -> Worker ${NAME}."
+          done
+
       - name: ♻️ 初始化数据库 / Initialize database
         run: |
           echo "🛠️ Starting database initialization..."
